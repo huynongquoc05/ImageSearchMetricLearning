@@ -6,8 +6,16 @@ Protocol:
   - Test: 100 lớp cuối, chỉ chạy MỘT lần ở cuối bằng checkpoint tốt nhất.
 
 Ví dụ:
+  # baseline cũ (augmentation cũ, BN không đóng băng)
   python train.py --root CUB_200_2011 --backbone resnet50 --loss ms \
-      --dim 256 --lr_bb 1e-4 --epochs 25 --name r50_ms
+      --dim 256 --lr_bb 1e-4 --epochs 25 --scale_min 0.5 --color_jitter 0 --name r50_ms_old
+
+  # recipe đề xuất cho ResNet-50
+  python train.py --root CUB_200_2011 --backbone resnet50 --loss ms --freeze_bn \
+      --dim 512 --lr_bb 3e-5 --epochs 60 --p 32 --k 4 --name r50_ms_fbn
+  python train.py --root CUB_200_2011 --backbone resnet50 --loss proxy_anchor --freeze_bn \
+      --dim 512 --lr_bb 3e-5 --lr_proxy 1e-2 --epochs 60 --p 32 --k 4 --name r50_pa_fbn
+
   python train.py --root CUB_200_2011 --backbone dinov2_vits14 --loss proxy_anchor \
       --dim 256 --lr_bb 5e-6 --lr_proxy 5e-3 --epochs 12 --name dino_pa
   python train.py --root CUB_200_2011 --smoke      # chạy thử vài bước để bắt lỗi
@@ -43,6 +51,8 @@ def get_args():
     ap.add_argument("--loss", choices=["ms", "proxy_anchor"], default="ms")
     ap.add_argument("--dim", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--iters_per_epoch", type=int, default=None,
+                    help="số batch mỗi epoch; mặc định = số ảnh train // (p*k) (~70 với 80 lớp)")
     ap.add_argument("--p", type=int, default=16, help="số lớp / batch")
     ap.add_argument("--k", type=int, default=4, help="số ảnh / lớp")
     ap.add_argument("--size", type=int, default=224)
@@ -54,6 +64,12 @@ def get_args():
     ap.add_argument("--val_classes", type=int, default=20, help="0 = không dùng val, lấy epoch cuối")
     ap.add_argument("--select_by", choices=["mAP@R", "R@1"], default="mAP@R",
                     help="metric val để chọn checkpoint")
+    # ---- augmentation / tiền xử lý (data.py) ----
+    ap.add_argument("--scale_min", type=float, default=0.25,
+                    help="cận dưới scale của RandomResizedCrop (cũ: 0.5)")
+    ap.add_argument("--color_jitter", type=float, default=0.2, help="0 = tắt ColorJitter")
+    ap.add_argument("--test_resize", choices=["crop", "full"], default="crop",
+                    help="crop = Resize+CenterCrop; full = Resize thẳng về size x size")
     ap.add_argument("--freeze_bn", action="store_true", help="đóng băng BatchNorm (ResNet)")
     ap.add_argument("--no_amp", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
@@ -76,10 +92,21 @@ def set_seed(s):
 
 
 def build_loss(a, num_classes):
+    # Lưu ý: MS loss và miner của pytorch_metric_learning mặc định dùng CosineSimilarity,
+    # tức là đã tự L2-normalize embedding bên trong; ProxyAnchorLoss cũng normalize embedding
+    # và proxy. Vì vậy không cần normalize thêm trước khi đưa vào loss.
     if a.loss == "ms":
         return (losses.MultiSimilarityLoss(alpha=2, beta=50, base=0.5),
                 miners.MultiSimilarityMiner(epsilon=0.1))
     return losses.ProxyAnchorLoss(num_classes, a.dim, margin=0.1, alpha=32), None
+
+
+def freeze_bn_params(model):
+    """Không cập nhật gamma/beta của BN (running stats do set_train giữ ở eval)."""
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+            for p in m.parameters():
+                p.requires_grad_(False)
 
 
 def set_train(model, freeze_bn):
@@ -112,26 +139,34 @@ def main():
     ckpt_path = out / "checkpoints" / f"{a.name}.pt"
 
     # ---- dữ liệu: tách val theo LỚP (cố định seed 0 để mọi run dùng cùng split) ----
+    train_tf = build_transform(True, a.size, scale_min=a.scale_min, color_jitter=a.color_jitter)
+    eval_tf = build_transform(False, a.size, test_resize=a.test_resize)
     full_train = CUBDataset(a.root, "train")
     classes = sorted(set(full_train.labels))
     val_c = random.Random(0).sample(classes, a.val_classes) if a.val_classes > 0 else []
     tr_c = [c for c in classes if c not in val_c]
-    train_ds = subset_by_classes(full_train, tr_c, build_transform(True, a.size))
-    val_ds = subset_by_classes(full_train, val_c, build_transform(False, a.size)) if val_c else None
-    test_ds = CUBDataset(a.root, "test", build_transform(False, a.size))
+    train_ds = subset_by_classes(full_train, tr_c, train_tf)
+    val_ds = subset_by_classes(full_train, val_c, eval_tf) if val_c else None
+    test_ds = CUBDataset(a.root, "test", eval_tf)
     print(f"train {len(train_ds)} ảnh/{len(tr_c)} lớp | val {len(val_ds) if val_ds else 0} ảnh/"
           f"{len(val_c)} lớp | test {len(test_ds)} ảnh | device {device} | amp {use_amp}")
 
-    train_loader = make_train_loader(train_ds, a.p, a.k, a.workers, num_batches=3 if a.smoke else None)
+    num_batches = 3 if a.smoke else a.iters_per_epoch
+    train_loader = make_train_loader(train_ds, a.p, a.k, a.workers,
+                                     num_batches=num_batches, seed=a.seed)
     val_loader = make_test_loader(val_ds, 64, a.workers) if val_ds else None
     test_loader = make_test_loader(test_ds, 64, a.workers)
+    print(f"{len(train_loader)} batch/epoch x {a.epochs} epoch = "
+          f"{len(train_loader) * a.epochs} iteration | batch {a.p * a.k}")
 
     # ---- model, loss, optimizer ----
     model = Embedder(a.backbone_timm, dim=a.dim, pretrained=True, img_size=a.size).to(device)
+    if a.freeze_bn:
+        freeze_bn_params(model)
     loss_fn, miner = build_loss(a, len(tr_c))
     loss_fn = loss_fn.to(device)
 
-    groups = [{"params": list(model.backbone.parameters()), "lr": a.lr_bb},
+    groups = [{"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": a.lr_bb},
               {"params": list(model.head.parameters()), "lr": a.lr_head}]
     proxy_params = list(loss_fn.parameters())
     if proxy_params:  # ProxyAnchor: proxy là tham số học được

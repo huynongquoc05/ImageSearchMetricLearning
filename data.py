@@ -15,20 +15,32 @@ import torchvision.transforms as T
 MEAN, STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 
-def build_transform(train: bool, size: int = 224):
+def build_transform(train: bool, size: int = 224, scale_min: float = 0.25,
+                    color_jitter: float = 0.2, test_resize: str = "crop"):
+    """
+    train:
+      scale_min    : cận dưới của RandomResizedCrop (cũ: 0.5). 0.25 -> augmentation mạnh hơn,
+                     giảm overfit vì tập train chỉ ~5.9k ảnh.
+      color_jitter : độ mạnh brightness/contrast/saturation (0 = tắt). Không đổi hue,
+                     vì màu lông là đặc trưng phân biệt loài chim.
+    test:
+      test_resize  : "crop" = Resize(size*256/224) + CenterCrop (như cũ, có thể cắt mất rìa)
+                     "full" = Resize thẳng về (size, size), giữ toàn bộ ảnh (méo nhẹ tỉ lệ)
+    """
+    assert test_resize in ("crop", "full")
     if train:
-        return T.Compose([
-            T.RandomResizedCrop(size, scale=(0.5, 1.0)),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-            T.Normalize(MEAN, STD),
-        ])
-    return T.Compose([
-        T.Resize(int(size * 256 / 224)),
-        T.CenterCrop(size),
-        T.ToTensor(),
-        T.Normalize(MEAN, STD),
-    ])
+        tf = [T.RandomResizedCrop(size, scale=(scale_min, 1.0)),
+              T.RandomHorizontalFlip()]
+        if color_jitter > 0:
+            tf.append(T.ColorJitter(brightness=color_jitter, contrast=color_jitter,
+                                    saturation=color_jitter))
+        tf += [T.ToTensor(), T.Normalize(MEAN, STD)]
+        return T.Compose(tf)
+    if test_resize == "full":
+        resize = [T.Resize((size, size))]
+    else:
+        resize = [T.Resize(int(size * 256 / 224)), T.CenterCrop(size)]
+    return T.Compose(resize + [T.ToTensor(), T.Normalize(MEAN, STD)])
 
 
 class CUBDataset(Dataset):
@@ -64,10 +76,15 @@ class CUBDataset(Dataset):
 
 
 class PKBatchSampler(Sampler):
-    """Mỗi batch: p lớp ngẫu nhiên, mỗi lớp k ảnh (lấy lặp nếu lớp có ít hơn k ảnh)."""
+    """Mỗi batch: p lớp ngẫu nhiên, mỗi lớp k ảnh (lấy lặp nếu lớp có ít hơn k ảnh).
 
-    def __init__(self, labels, p: int, k: int, num_batches: int = None):
+    seed: nếu có, dùng bộ sinh số ngẫu nhiên riêng -> tái lập được mà không phụ thuộc
+          trạng thái `random` toàn cục. None = dùng `random` toàn cục như cũ.
+    """
+
+    def __init__(self, labels, p: int, k: int, num_batches: int = None, seed: int = None):
         self.p, self.k = p, k
+        self.rng = random.Random(seed) if seed is not None else random
         self.by_class = defaultdict(list)
         for i, y in enumerate(labels):
             self.by_class[y].append(i)
@@ -81,16 +98,17 @@ class PKBatchSampler(Sampler):
     def __iter__(self):
         for _ in range(self.num_batches):
             batch = []
-            for c in random.sample(self.classes, self.p):
+            for c in self.rng.sample(self.classes, self.p):
                 idxs = self.by_class[c]
-                batch += random.sample(idxs, self.k) if len(idxs) >= self.k \
-                    else random.choices(idxs, k=self.k)
+                batch += self.rng.sample(idxs, self.k) if len(idxs) >= self.k \
+                    else self.rng.choices(idxs, k=self.k)
             yield batch
 
 
-def make_train_loader(ds, p: int = 16, k: int = 4, workers: int = 4, num_batches: int = None):
+def make_train_loader(ds, p: int = 16, k: int = 4, workers: int = 4,
+                      num_batches: int = None, seed: int = None):
     """Mỗi batch gồm p lớp, mỗi lớp k ảnh -> batch_size = p * k."""
-    return DataLoader(ds, batch_sampler=PKBatchSampler(ds.labels, p, k, num_batches),
+    return DataLoader(ds, batch_sampler=PKBatchSampler(ds.labels, p, k, num_batches, seed),
                       num_workers=workers, pin_memory=True, persistent_workers=workers > 0)
 
 
