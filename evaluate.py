@@ -3,15 +3,24 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def _embed(model, x, device, amp):
+    with torch.autocast(device_type=device.type, dtype=torch.float16,
+                        enabled=amp and device.type == "cuda"):
+        f = model(x)
+    return F.normalize(f.float(), dim=1)
+
+
 @torch.no_grad()
-def extract(model, loader, device, amp: bool = True):
+def extract(model, loader, device, amp: bool = True, flip: bool = False):
+    """flip=True: TTA, lấy trung bình embedding (đã normalize) của ảnh gốc và ảnh lật ngang."""
     model.eval()
     feats, labels = [], []
     for x, y in tqdm(loader, desc="extract", leave=False):
-        with torch.autocast(device_type=device.type, dtype=torch.float16,
-                            enabled=amp and device.type == "cuda"):
-            f = model(x.to(device, non_blocking=True))
-        feats.append(F.normalize(f.float(), dim=1).cpu())
+        x = x.to(device, non_blocking=True)
+        f = _embed(model, x, device, amp)
+        if flip:
+            f = F.normalize(f + _embed(model, x.flip(3), device, amp), dim=1)
+        feats.append(f.cpu())
         labels.append(torch.as_tensor(y))
     return torch.cat(feats), torch.cat(labels)
 
@@ -41,8 +50,8 @@ def map_at_r(feats, labels):
     return ap.mean().item() * 100
 
 
-def evaluate(model, loader, device):
-    feats, labels = extract(model, loader, device)
+def evaluate(model, loader, device, flip: bool = False):
+    feats, labels = extract(model, loader, device, flip=flip)
     out = recall_at_k(feats, labels)
     out["mAP@R"] = map_at_r(feats, labels)
     return out

@@ -70,7 +70,11 @@ def get_args():
     ap.add_argument("--color_jitter", type=float, default=0.2, help="0 = tắt ColorJitter")
     ap.add_argument("--test_resize", choices=["crop", "full"], default="crop",
                     help="crop = Resize+CenterCrop; full = Resize thẳng về size x size")
+    ap.add_argument("--pool", default=None,
+                    help="global pooling cho CNN, vd avgmax (= avg+max); bỏ qua với ViT")
     ap.add_argument("--freeze_bn", action="store_true", help="đóng băng BatchNorm (ResNet)")
+    ap.add_argument("--multi_gpu", action="store_true",
+                    help="dùng tất cả GPU qua DataParallel (Kaggle T4 x2); loss vẫn tính trên cả batch")
     ap.add_argument("--no_amp", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
@@ -160,7 +164,13 @@ def main():
           f"{len(train_loader) * a.epochs} iteration | batch {a.p * a.k}")
 
     # ---- model, loss, optimizer ----
-    model = Embedder(a.backbone_timm, dim=a.dim, pretrained=True, img_size=a.size).to(device)
+    model = Embedder(a.backbone_timm, dim=a.dim, pretrained=True, img_size=a.size,
+                     pool=a.pool).to(device)
+    model.amp = use_amp
+    net = model
+    if a.multi_gpu and torch.cuda.device_count() > 1:
+        net = torch.nn.DataParallel(model)  # batch chia đôi cho 2 GPU, embedding gom về GPU 0
+        print(f"DataParallel trên {torch.cuda.device_count()} GPU")
     if a.freeze_bn:
         freeze_bn_params(model)
     loss_fn, miner = build_loss(a, len(tr_c))
@@ -187,7 +197,7 @@ def main():
     # ---- vòng train ----
     history, best_score, best_epoch = [], -1.0, 0
     if val_loader:
-        m0 = evaluate(model, val_loader, device)  # head ngẫu nhiên: mốc trước khi train
+        m0 = evaluate(net, val_loader, device)  # head ngẫu nhiên: mốc trước khi train
         history.append({"epoch": 0, "loss": None, "val": m0})
         print(f"ep 00 | val {fmt(m0)}")
 
@@ -197,8 +207,7 @@ def main():
         run_loss, n = 0.0, 0
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                emb = model(x)
+            emb = net(x)  # autocast nằm trong Embedder.forward
             emb = emb.float()  # tính loss ở fp32
             loss = loss_fn(emb, y, miner(emb, y)) if miner else loss_fn(emb, y)
             opt.zero_grad(set_to_none=True)
@@ -211,7 +220,7 @@ def main():
         rec = {"epoch": ep, "loss": run_loss / max(1, n)}
         msg = f"ep {ep:02d}/{a.epochs} | loss {rec['loss']:.4f}"
         if val_loader:
-            rec["val"] = evaluate(model, val_loader, device)
+            rec["val"] = evaluate(net, val_loader, device)
             msg += f" | val {fmt(rec['val'])}"
             if rec["val"][a.select_by] > best_score:
                 best_score, best_epoch = rec["val"][a.select_by], ep
@@ -231,8 +240,10 @@ def main():
     res_path.write_text(json.dumps(result, indent=2))  # ghi trước, phòng khi bước test lỗi
     if not a.smoke:
         model.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
-        result["test"] = evaluate(model, test_loader, device)
+        result["test"] = evaluate(net, test_loader, device)
+        result["test_flip_tta"] = evaluate(net, test_loader, device, flip=True)
         print(f"TEST (epoch {best_epoch}): " + " ".join(f"{k} {v:.2f}" for k, v in result["test"].items()))
+        print(f"TEST + flip TTA     : " + " ".join(f"{k} {v:.2f}" for k, v in result["test_flip_tta"].items()))
     (out / "results" / f"{a.name}.json").write_text(json.dumps(result, indent=2))
     print("saved ->", out / "results" / f"{a.name}.json")
 

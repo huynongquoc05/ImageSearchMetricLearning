@@ -1,0 +1,13 @@
+%%bash
+R=/kaggle/input/datasets/wenewone/cub2002011/CUB_200_2011
+O=/kaggle/working
+
+CUDA_VISIBLE_DEVICES=0 python train.py --root $R --out_dir $O --name r50_ms_f1 --backbone resnet50 --loss ms \
+  --freeze_bn --pool avgmax --dim 512 --lr_bb 3e-5 --lr_head 1e-3 \
+  --p 32 --k 4 --epochs 15 --size 320 --workers 2 > $O/r50_ms_f1.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 python train.py --root $R --out_dir $O --name r50_pa_f1 --backbone resnet50 --loss proxy_anchor \
+  --freeze_bn --pool avgmax --dim 512 --lr_bb 3e-5 --lr_head 1e-3 --lr_proxy 1e-2 \
+  --p 32 --k 4 --epochs 15 --size 320 --workers 2 > $O/r50_pa_f1.log 2>&1 &
+
+wait
